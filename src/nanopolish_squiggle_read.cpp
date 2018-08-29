@@ -356,8 +356,15 @@ void SquiggleRead::load_from_raw(hid_t hdf5_file, const uint32_t flags)
     free(rt.raw);
     free(et.event);
 
-    // align events to the basecalled read
+    // align events to the basecalled read. Bottleneck.
     std::vector<AlignedPair> event_alignment = adaptive_banded_simple_event_align(*this, *this->base_model[strand_idx], read_sequence);
+
+    base_to_event_map_from_event_alignment(event_alignment);
+}
+
+void SquiggleRead::base_to_event_map_from_event_alignment(const std::vector<AlignedPair> & event_alignment){
+    size_t strand_idx = 0;
+    std::string alphabet = "nucleotide";
 
     // transform alignment into the base-to-event map
     if(event_alignment.size() > 0) {
@@ -392,7 +399,7 @@ void SquiggleRead::load_from_raw(hid_t hdf5_file, const uint32_t flags)
 
         // prepare data structures for the final calibration
         std::vector<EventAlignment> alignment =
-            get_eventalignment_for_1d_basecalls(read_sequence, alphabet, this->base_to_event_map, this->base_model[strand_idx]->k, strand_idx, 0);
+                get_eventalignment_for_1d_basecalls(read_sequence, alphabet, this->base_to_event_map, this->base_model[strand_idx]->k, strand_idx, 0);
 
         // run recalibration to get the best set of scaling parameters and the residual
         // between the (scaled) event levels and the model.
@@ -424,7 +431,7 @@ void SquiggleRead::load_from_raw(hid_t hdf5_file, const uint32_t flags)
         events[0].clear();
         events[1].clear();
     }
-}
+};
 
 void SquiggleRead::_load_R7(uint32_t si)
 {

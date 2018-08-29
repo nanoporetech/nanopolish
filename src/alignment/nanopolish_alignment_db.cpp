@@ -566,7 +566,7 @@ std::vector<EventAlignmentRecord> AlignmentDB::_load_events_by_region_from_read(
         const SequenceAlignmentRecord& seq_record = sequence_records[i];
 
         // conditionally load the squiggle read if it hasn't been loaded already
-        _load_squiggle_read(seq_record.read_name);
+        _load_squiggle_read(seq_record.read_name); //Alignment happens here.
 
         for(size_t si = 0; si < NUM_STRANDS; ++si) {
             

@@ -17,6 +17,8 @@
 #include "nanopolish_pore_model_set.h"
 #include <string>
 
+struct AlignedPair; //forward declaration
+
 enum PoreType
 {
     PT_UNKNOWN = 0,
@@ -346,6 +348,8 @@ class SquiggleRead
 
         // check basecall_group and read_type
         bool check_basecall_group() const;
+
+        void base_to_event_map_from_event_alignment(const std::vector<AlignedPair> & event_alignment);
 };
 
 #endif
