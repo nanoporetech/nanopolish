@@ -116,6 +116,8 @@ SquiggleRead::SquiggleRead(const std::string& name, const ReadDB& read_db, const
         } else {
             this->read_sequence = read_db.get_read_sequence(read_name);
             load_from_raw(hdf5_file, flags);
+            // align events to the basecalled read. Bottleneck.
+            size_t strand_idx = 0;
         }
 
         fast5_close(hdf5_file);
@@ -355,11 +357,6 @@ void SquiggleRead::load_from_raw(hid_t hdf5_file, const uint32_t flags)
     assert(et.event != NULL);
     free(rt.raw);
     free(et.event);
-
-    // align events to the basecalled read. Bottleneck.
-    std::vector<AlignedPair> event_alignment = adaptive_banded_simple_event_align(*this, *this->base_model[strand_idx], read_sequence);
-
-    base_to_event_map_from_event_alignment(event_alignment);
 }
 
 void SquiggleRead::base_to_event_map_from_event_alignment(const std::vector<AlignedPair> & event_alignment){

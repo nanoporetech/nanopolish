@@ -293,6 +293,7 @@ class SquiggleRead
         // one set of parameters per strand
         TransitionParameters parameters[2];
 
+        void base_to_event_map_from_event_alignment(const std::vector<AlignedPair> & event_alignment);
     private:
         // private data
         fast5::File* f_p;
@@ -348,8 +349,6 @@ class SquiggleRead
 
         // check basecall_group and read_type
         bool check_basecall_group() const;
-
-        void base_to_event_map_from_event_alignment(const std::vector<AlignedPair> & event_alignment);
 };
 
 #endif

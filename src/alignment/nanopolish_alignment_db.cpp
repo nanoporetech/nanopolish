@@ -8,6 +8,7 @@
 //
 #include <assert.h>
 #include <algorithm>
+#include <nanopolish_raw_loader.h>
 #include "nanopolish_alignment_db.h"
 #include "htslib/faidx.h"
 #include "htslib/hts.h"
@@ -564,17 +565,31 @@ std::vector<EventAlignmentRecord> AlignmentDB::_load_events_by_region_from_read(
     #pragma omp parallel for
     for(size_t i = 0; i < sequence_records.size(); ++i) {
         const SequenceAlignmentRecord& seq_record = sequence_records[i];
-
         // conditionally load the squiggle read if it hasn't been loaded already
-        _load_squiggle_read(seq_record.read_name); //Alignment happens here.
+        _load_squiggle_read(seq_record.read_name); // MV Alignment happens here. (used to)
+    }
+
+    //Perform all the alignments - this part should be delegated to GPU.
+    #pragma omp parallel for
+    for (int r_idx = 0; r_idx<sequence_records.size(); r_idx++){
+        auto record = sequence_records[r_idx];
+        SquiggleRead* sr = m_squiggle_read_map[record.read_name];
+        auto model = sr->base_model[0];
+        std::vector<AlignedPair> event_alignment = adaptive_banded_simple_event_align(*sr, *model, sr->read_sequence);
+        sr->base_to_event_map_from_event_alignment(event_alignment);
+    }
+
+    #pragma omp parallel for
+    for(size_t i = 0; i < sequence_records.size(); ++i) {
+        const SequenceAlignmentRecord& seq_record = sequence_records[i];
 
         for(size_t si = 0; si < NUM_STRANDS; ++si) {
-            
+
             // skip complement
             if(si == C_IDX) {
                 continue;
             }
-    
+
             // skip reads that do not have events here
             SquiggleRead* sr = m_squiggle_read_map[seq_record.read_name];
             if(!sr->has_events_for_strand(si)) {
@@ -629,7 +644,6 @@ void AlignmentDB::_load_squiggle_read(const std::string& read_name)
         
         // Allow the load to happen in parallel but lock access to adding it into the map
         SquiggleRead* sr = new SquiggleRead(read_name, m_read_db);
-        
         #pragma omp critical
         m_squiggle_read_map[read_name] = sr;
     }
