@@ -14,6 +14,7 @@
 #include "htslib/hts.h"
 #include "htslib/sam.h"
 #include "nanopolish_methyltrain.h"
+#include "../../htslib/htslib/sam.h"
 
 // Various file handle and structures
 // needed to traverse a bam file
@@ -558,11 +559,22 @@ std::vector<EventAlignmentRecord> AlignmentDB::_load_events_by_region_from_bam(c
     return records;
 }
 
+//For now we do this as a loop, then delegate to GPU.
+void AlignmentDB::_batch_align(const std::vector<SequenceAlignmentRecord>& sequence_records){
+    for(int i=0;i < sequence_records.size(); i++) {
+        auto record = sequence_records[i];
+        SquiggleRead *sr = m_squiggle_read_map[record.read_name];
+        auto model = sr->base_model[0];
+        std::vector<AlignedPair> event_alignment = adaptive_banded_simple_event_align(*sr, *model, sr->read_sequence);
+        sr->base_to_event_map_from_event_alignment(event_alignment);
+    }
+};
+
 std::vector<EventAlignmentRecord> AlignmentDB::_load_events_by_region_from_read(const std::vector<SequenceAlignmentRecord>& sequence_records)
 {
     std::vector<EventAlignmentRecord> records;
 
-    #pragma omp parallel for
+    //#pragma omp parallel for
     for(size_t i = 0; i < sequence_records.size(); ++i) {
         const SequenceAlignmentRecord& seq_record = sequence_records[i];
         // conditionally load the squiggle read if it hasn't been loaded already
@@ -570,13 +582,22 @@ std::vector<EventAlignmentRecord> AlignmentDB::_load_events_by_region_from_read(
     }
 
     //Perform all the alignments - this part should be delegated to GPU.
-    #pragma omp parallel for
-    for (int r_idx = 0; r_idx<sequence_records.size(); r_idx++){
-        auto record = sequence_records[r_idx];
-        SquiggleRead* sr = m_squiggle_read_map[record.read_name];
-        auto model = sr->base_model[0];
-        std::vector<AlignedPair> event_alignment = adaptive_banded_simple_event_align(*sr, *model, sr->read_sequence);
-        sr->base_to_event_map_from_event_alignment(event_alignment);
+    size_t batch_size = 10;
+    size_t num_records = sequence_records.size();
+    int num_batches = num_records / batch_size;
+    if ((num_records % batch_size) != 0){
+        num_batches++;
+    }
+    int record_idx = 0;
+    for (int batch_idx=0; batch_idx<num_batches; batch_idx++){
+        std::vector<SequenceAlignmentRecord> record_batch;
+        for(int b=0; b<batch_size;b++){
+            if (record_idx < sequence_records.size()) {
+                record_batch.push_back(sequence_records[record_idx]);
+                record_idx++;
+            }
+        }
+        _batch_align(record_batch);
     }
 
     #pragma omp parallel for

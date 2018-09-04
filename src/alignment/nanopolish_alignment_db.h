@@ -150,6 +150,8 @@ class AlignmentDB
         std::vector<EventAlignmentRecord> m_event_records;
         SquiggleReadMap m_squiggle_read_map;
         std::string m_model_type_string;
+
+    void _batch_align(const std::vector<SequenceAlignmentRecord> &sequence_records);
 };
 
 #endif
