@@ -9,6 +9,7 @@
 #include <assert.h>
 #include <algorithm>
 #include <nanopolish_raw_loader.h>
+#include <cuda_kernels/GpuAligner.h>
 #include "nanopolish_alignment_db.h"
 #include "htslib/faidx.h"
 #include "htslib/hts.h"
@@ -561,10 +562,20 @@ std::vector<EventAlignmentRecord> AlignmentDB::_load_events_by_region_from_bam(c
 
 //For now we do this as a loop, then delegate to GPU.
 void AlignmentDB::_batch_align(const std::vector<SequenceAlignmentRecord>& sequence_records){
-    for(int i=0;i < sequence_records.size(); i++) {
-        auto record = sequence_records[i];
-        SquiggleRead *sr = m_squiggle_read_map[record.read_name];
-        auto model = sr->base_model[0];
+    size_t num_sequence_records = sequence_records.size();
+    std::vector<SquiggleRead*> reads(num_sequence_records);
+    for (int i=0; i<num_sequence_records;i++){
+        reads[i] = m_squiggle_read_map[sequence_records[i].read_name];
+    }
+    auto model = reads[0]->base_model[0];
+
+    // The GPU method:
+    GpuAdaptiveBandedAligner gpu_aligner;
+    std::vector<std::vector<AlignedPair>> event_alignment_gpu = gpu_aligner.align(reads, model);
+
+    // The CPU method:
+    for(int i=0;i < num_sequence_records; i++) {
+        SquiggleRead *sr = reads[i];
         std::vector<AlignedPair> event_alignment = adaptive_banded_simple_event_align(*sr, *model, sr->read_sequence);
         sr->base_to_event_map_from_event_alignment(event_alignment);
     }
@@ -582,8 +593,9 @@ std::vector<EventAlignmentRecord> AlignmentDB::_load_events_by_region_from_read(
     }
 
     //Perform all the alignments - this part should be delegated to GPU.
-    size_t batch_size = 10;
+    size_t batch_size = 50;
     size_t num_records = sequence_records.size();
+    printf("Number of records is: %i\n", num_records);
     int num_batches = num_records / batch_size;
     if ((num_records % batch_size) != 0){
         num_batches++;

@@ -727,3 +727,77 @@ std::vector<Variant> GpuAligner::variantScoresThresholded(std::vector<std::vecto
   }
   return v;
 }
+
+GpuAdaptiveBandedAligner::GpuAdaptiveBandedAligner(){
+    size_t max_reads_per_worker = LOCI_PER_WORKER * MAX_COVERAGE * MAX_NUM_VARIANTS_PER_LOCUS;
+    int readsSizeBuffer = max_reads_per_worker * sizeof(int);
+    int maxBuffer = max_reads_per_worker * MAX_SEQUENCE_LENGTH * sizeof(int);
+    size_t numModelElements = 4096;
+
+    //allocate a buffer to hold the number of events per read
+    CU_CHECK_ERR(cudaMalloc((void**)&nEventsDev, readsSizeBuffer));
+    CU_CHECK_ERR(cudaHostAlloc(&nEventsHost, readsSizeBuffer, cudaHostAllocDefault));
+
+    CU_CHECK_ERR(cudaMalloc((void**)&nKmersDev, readsSizeBuffer));
+    CU_CHECK_ERR(cudaHostAlloc(&nKmersHost, readsSizeBuffer, cudaHostAllocDefault));
+
+    CU_CHECK_ERR(cudaMalloc((void**)&kmersDev, maxBuffer));
+    CU_CHECK_ERR(cudaHostAlloc(&kmersHost, maxBuffer, cudaHostAllocDefault));
+}
+
+GpuAdaptiveBandedAligner::~GpuAdaptiveBandedAligner(){
+    CU_CHECK_ERR(cudaFree(nEventsDev));
+    CU_CHECK_ERR(cudaFree(nKmersDev));
+    CU_CHECK_ERR(cudaFree(kmersDev));
+
+    CU_CHECK_ERR(cudaFreeHost(nEventsHost));
+    CU_CHECK_ERR(cudaFreeHost(nKmersHost));
+    CU_CHECK_ERR(cudaFreeHost(kmersHost));
+}
+
+__global__ void adaptiveBandedAlign(int numReads,
+                                    int * nkmersDev,
+                                    int * kmersDev)
+{
+    // Each thread is a separate alignment
+    // Print out some values as a sanity check
+    // printf("Threadidx: %i, N Kmers: %i\n", threadIdx.x, nkmersDev[threadIdx.x]);
+    if (threadIdx.x == 0){
+        printf("num reads %i\n", numReads);
+    }
+};
+
+std::vector<std::vector<AlignedPair>> GpuAdaptiveBandedAligner::align(std::vector<SquiggleRead *> reads, const PoreModel *pore_model) {
+    size_t numReads = reads.size();
+    size_t strand_idx = 0;
+    size_t k = pore_model->k;
+    const Alphabet* alphabet = pore_model->pmalphabet;
+
+    //Loop over all the reads, populating host buffers with the relevant information
+    int kmersOffset = 0;
+    for (int readIdx=0; readIdx < numReads; readIdx++) {//switch to index
+        // Populate host buffer with kmer ranks
+        auto read = reads[readIdx];
+        auto sequence = read->read_sequence;
+        size_t n_kmers = sequence.size() - k + 1;
+        for(int kmerIdx=0; kmerIdx<n_kmers;kmerIdx++){
+            kmersHost[kmerIdx + kmersOffset] = alphabet->kmer_rank(sequence.substr(kmerIdx, k).c_str(), k);
+        }
+        kmersOffset += n_kmers;
+        nKmersHost[readIdx] = kmersOffset;
+    }
+
+    // do the transfers
+    CU_CHECK_ERR(cudaMemcpyAsync(nKmersDev, nKmersHost, numReads * sizeof(int), cudaMemcpyHostToDevice));
+    CU_CHECK_ERR(cudaMemcpyAsync(kmersDev, kmersHost, kmersOffset * sizeof(int), cudaMemcpyHostToDevice));
+
+    // run the kernel
+    size_t blockSize = numReads;
+    size_t numBlocks = 1;
+    dim3 dimBlock(blockSize);
+    dim3 dimGrid(numBlocks);
+
+    adaptiveBandedAlign <<<dimGrid, dimBlock, 0 >>> (numReads, nKmersDev, kmersDev);
+
+    return std::vector<std::vector<AlignedPair>>();
+}

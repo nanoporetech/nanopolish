@@ -52,6 +52,21 @@ typedef struct {
     std::vector<HMMInputData> rawData;
 } ScoreSet;
 
+class GpuAdaptiveBandedAligner {
+public:
+    GpuAdaptiveBandedAligner();
+    ~GpuAdaptiveBandedAligner();
+    std::vector<std::vector<AlignedPair>> align(std::vector<SquiggleRead *> read, const PoreModel *pModel);
+private:
+    int * nEventsDev;
+    int * nKmersDev;
+    int * kmersDev;
+
+    int * nEventsHost;
+    int * nKmersHost;
+    int * kmersHost;
+};
+
 class GpuAligner
 {
 public:
