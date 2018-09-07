@@ -734,6 +734,11 @@ GpuAdaptiveBandedAligner::GpuAdaptiveBandedAligner(){
     int maxBuffer = max_reads_per_worker * MAX_SEQUENCE_LENGTH * sizeof(int);
     size_t numModelElements = 4096;
 
+    // Need to allocate memory for the DP tables
+    int max_n_bands = (ADAPTIVE_ALIGNMENT_MAX_N_EVENTS + 1) + (ADAPTIVE_ALIGNMENT_MAX_N_KMERS + 1);
+    int max_band_buffer_size = ADAPTIVE_ALIGNMENT_MAX_NUM_READS * max_n_bands *
+      ADAPTIVE_ALIGNMENT_BANDWIDTH * sizeof(float);
+
     //allocate a buffer to hold the number of events per read
     CU_CHECK_ERR(cudaMalloc((void**)&nEventsDev, readsSizeBuffer));
     CU_CHECK_ERR(cudaHostAlloc(&nEventsHost, readsSizeBuffer, cudaHostAllocDefault));
@@ -743,28 +748,58 @@ GpuAdaptiveBandedAligner::GpuAdaptiveBandedAligner(){
 
     CU_CHECK_ERR(cudaMalloc((void**)&kmersDev, maxBuffer));
     CU_CHECK_ERR(cudaHostAlloc(&kmersHost, maxBuffer, cudaHostAllocDefault));
+
+    CU_CHECK_ERR(cudaMalloc((void**)&eventsDev, maxBuffer));
+    CU_CHECK_ERR(cudaHostAlloc(&eventsHost, readsSizeBuffer, cudaHostAllocDefault));
+
+    CU_CHECK_ERR(cudaMalloc((void**)&bandScoreBuffer, max_band_buffer_size));
 }
 
 GpuAdaptiveBandedAligner::~GpuAdaptiveBandedAligner(){
     CU_CHECK_ERR(cudaFree(nEventsDev));
+    CU_CHECK_ERR(cudaFree(eventsDev));
     CU_CHECK_ERR(cudaFree(nKmersDev));
     CU_CHECK_ERR(cudaFree(kmersDev));
+    CU_CHECK_ERR(cudaFree(bandScoreBuffer));
 
     CU_CHECK_ERR(cudaFreeHost(nEventsHost));
     CU_CHECK_ERR(cudaFreeHost(nKmersHost));
     CU_CHECK_ERR(cudaFreeHost(kmersHost));
+    //CU_CHECK_ERR(cudaFree(eventsHost));
 }
 
-__global__ void adaptiveBandedAlign(int numReads,
-                                    int * nkmersDev,
-                                    int * kmersDev)
+__global__ void adaptiveBandedAlign(float* bandScoreBuffer,
+                                    int numReads,
+                                    int * nKmersDev,
+                                    int * kmersDev,
+				                    int * nEventsDev,
+                                    float * eventsDev)
 {
-    // Each thread is a separate alignment
-    // Print out some values as a sanity check
-    // printf("Threadidx: %i, N Kmers: %i\n", threadIdx.x, nkmersDev[threadIdx.x]);
-    if (threadIdx.x == 0){
-        printf("num reads %i\n", numReads);
-    }
+  int n_kmers = nKmersDev[threadIdx.x];
+  int n_events = nEventsDev[threadIdx.x];
+
+  float min_average_log_emission = -5.0;
+  int max_gap_threshold = 50;
+
+  // banding
+  int half_bandwidth = ADAPTIVE_ALIGNMENT_BANDWIDTH / 2;
+
+  // transition penalties
+  float events_per_kmer = n_events / n_kmers;
+  float p_stay = 1 - (1 / (events_per_kmer + 1));
+
+  // setting a tiny skip penalty helps keep the true alignment within the adaptive band
+  // this was empirically determined
+  double epsilon = 1e-10;
+  double lp_skip = log(epsilon);
+  double lp_stay = log(p_stay);
+  double lp_step = log(1.0 - exp(lp_skip) - exp(lp_stay));
+  double lp_trim = log(0.01);
+ 
+  // dp matrix
+  size_t n_rows = n_events + 1;
+  size_t n_cols = n_kmers + 1;
+  size_t n_bands = n_rows + n_cols;
 };
 
 std::vector<std::vector<AlignedPair>> GpuAdaptiveBandedAligner::align(std::vector<SquiggleRead *> reads, const PoreModel *pore_model) {
@@ -780,16 +815,21 @@ std::vector<std::vector<AlignedPair>> GpuAdaptiveBandedAligner::align(std::vecto
         auto read = reads[readIdx];
         auto sequence = read->read_sequence;
         size_t n_kmers = sequence.size() - k + 1;
+	    size_t n_events = read->events->size(); //read->events.size();
         for(int kmerIdx=0; kmerIdx<n_kmers;kmerIdx++){
-            kmersHost[kmerIdx + kmersOffset] = alphabet->kmer_rank(sequence.substr(kmerIdx, k).c_str(), k);
+	  kmersHost[kmerIdx + kmersOffset] = alphabet->kmer_rank(sequence.substr(kmerIdx, k).c_str(), k);
         }
+	//TODO: Will also need to transfer the offsets.
         kmersOffset += n_kmers;
-        nKmersHost[readIdx] = kmersOffset;
+        nKmersHost[readIdx] = n_kmers;
+	nEventsHost[readIdx] = n_events;
     }
 
-    // do the transfers
+  
+   // do the transfers
     CU_CHECK_ERR(cudaMemcpyAsync(nKmersDev, nKmersHost, numReads * sizeof(int), cudaMemcpyHostToDevice));
     CU_CHECK_ERR(cudaMemcpyAsync(kmersDev, kmersHost, kmersOffset * sizeof(int), cudaMemcpyHostToDevice));
+    CU_CHECK_ERR(cudaMemcpyAsync(nEventsDev, nEventsHost, numReads * sizeof(int), cudaMemcpyHostToDevice));
 
     // run the kernel
     size_t blockSize = numReads;
@@ -797,7 +837,7 @@ std::vector<std::vector<AlignedPair>> GpuAdaptiveBandedAligner::align(std::vecto
     dim3 dimBlock(blockSize);
     dim3 dimGrid(numBlocks);
 
-    adaptiveBandedAlign <<<dimGrid, dimBlock, 0 >>> (numReads, nKmersDev, kmersDev);
+    adaptiveBandedAlign <<<dimGrid, dimBlock, 0 >>> (bandScoreBuffer, numReads, nKmersDev, kmersDev, nEventsDev, eventsDev);
 
     return std::vector<std::vector<AlignedPair>>();
 }

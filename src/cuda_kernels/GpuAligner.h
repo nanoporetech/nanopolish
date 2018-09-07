@@ -46,6 +46,11 @@
 #define MAX_NUM_VARIANTS_PER_LOCUS 10
 #define MAX_NUM_WORKERS 16
 
+#define ADAPTIVE_ALIGNMENT_MAX_N_EVENTS 100000
+#define ADAPTIVE_ALIGNMENT_MAX_N_KMERS 50000
+#define ADAPTIVE_ALIGNMENT_BANDWIDTH 100
+#define ADAPTIVE_ALIGNMENT_MAX_NUM_READS 100
+
 //Data to be scored
 typedef struct {
     std::vector<HMMInputSequence> stateSequences;
@@ -61,10 +66,13 @@ private:
     int * nEventsDev;
     int * nKmersDev;
     int * kmersDev;
+    float * eventsDev;
+    float * bandScoreBuffer;
 
     int * nEventsHost;
     int * nKmersHost;
     int * kmersHost;
+    float * eventsHost;
 };
 
 class GpuAligner

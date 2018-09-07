@@ -595,7 +595,7 @@ std::vector<EventAlignmentRecord> AlignmentDB::_load_events_by_region_from_read(
     //Perform all the alignments - this part should be delegated to GPU.
     size_t batch_size = 50;
     size_t num_records = sequence_records.size();
-    printf("Number of records is: %i\n", num_records);
+
     int num_batches = num_records / batch_size;
     if ((num_records % batch_size) != 0){
         num_batches++;
