@@ -49,7 +49,7 @@
 #define ADAPTIVE_ALIGNMENT_MAX_N_EVENTS 100000
 #define ADAPTIVE_ALIGNMENT_MAX_N_KMERS 50000
 #define ADAPTIVE_ALIGNMENT_BANDWIDTH 100
-#define ADAPTIVE_ALIGNMENT_MAX_NUM_READS 100
+#define ADAPTIVE_ALIGNMENT_MAX_NUM_READS 15
 
 //Data to be scored
 typedef struct {
@@ -68,6 +68,7 @@ private:
     int * kmersDev;
     float * eventsDev;
     float * bandScoreBuffer;
+    int * traceBuffer;
 
     int * nEventsHost;
     int * nKmersHost;

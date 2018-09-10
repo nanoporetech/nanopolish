@@ -736,8 +736,7 @@ GpuAdaptiveBandedAligner::GpuAdaptiveBandedAligner(){
 
     // Need to allocate memory for the DP tables
     int max_n_bands = (ADAPTIVE_ALIGNMENT_MAX_N_EVENTS + 1) + (ADAPTIVE_ALIGNMENT_MAX_N_KMERS + 1);
-    int max_band_buffer_size = ADAPTIVE_ALIGNMENT_MAX_NUM_READS * max_n_bands *
-      ADAPTIVE_ALIGNMENT_BANDWIDTH * sizeof(float);
+    int max_band_buffer_size = ADAPTIVE_ALIGNMENT_MAX_NUM_READS * max_n_bands * ADAPTIVE_ALIGNMENT_BANDWIDTH * sizeof(float);
 
     //allocate a buffer to hold the number of events per read
     CU_CHECK_ERR(cudaMalloc((void**)&nEventsDev, readsSizeBuffer));
@@ -752,6 +751,7 @@ GpuAdaptiveBandedAligner::GpuAdaptiveBandedAligner(){
     CU_CHECK_ERR(cudaMalloc((void**)&eventsDev, maxBuffer));
     CU_CHECK_ERR(cudaHostAlloc(&eventsHost, readsSizeBuffer, cudaHostAllocDefault));
 
+    CU_CHECK_ERR(cudaMalloc((void**)&traceBuffer, max_band_buffer_size));
     CU_CHECK_ERR(cudaMalloc((void**)&bandScoreBuffer, max_band_buffer_size));
 }
 
@@ -761,6 +761,7 @@ GpuAdaptiveBandedAligner::~GpuAdaptiveBandedAligner(){
     CU_CHECK_ERR(cudaFree(nKmersDev));
     CU_CHECK_ERR(cudaFree(kmersDev));
     CU_CHECK_ERR(cudaFree(bandScoreBuffer));
+    CU_CHECK_ERR(cudaFree(traceBuffer));
 
     CU_CHECK_ERR(cudaFreeHost(nEventsHost));
     CU_CHECK_ERR(cudaFreeHost(nKmersHost));
@@ -769,6 +770,7 @@ GpuAdaptiveBandedAligner::~GpuAdaptiveBandedAligner(){
 }
 
 __global__ void adaptiveBandedAlign(float* bandScoreBuffer,
+                                    int* traceBuffer,
                                     int numReads,
                                     int * nKmersDev,
                                     int * kmersDev,
@@ -797,9 +799,19 @@ __global__ void adaptiveBandedAlign(float* bandScoreBuffer,
   double lp_trim = log(0.01);
  
   // dp matrix
-  size_t n_rows = n_events + 1;
-  size_t n_cols = n_kmers + 1;
-  size_t n_bands = n_rows + n_cols;
+  int n_rows = n_events + 1;
+  int n_cols = n_kmers + 1;
+  int n_bands = n_rows + n_cols;
+
+    printf("Thread IDX: %i, n_bands: %i\n", threadIdx.x, n_bands);
+    // Initialize the DP tables. Band-major, interleaved. -- is this correct
+    // Is this what is taking so long?
+    for(int band_idx = 0; band_idx<n_bands; band_idx++){
+        for(int b=0; b<ADAPTIVE_ALIGNMENT_BANDWIDTH; b++){
+            bandScoreBuffer[(band_idx * blockDim.x + threadIdx.x) * ADAPTIVE_ALIGNMENT_BANDWIDTH + b] = -INFINITY;
+            traceBuffer[(band_idx * blockDim.x + threadIdx.x) * ADAPTIVE_ALIGNMENT_BANDWIDTH + b] = 0;
+        }
+    }
 };
 
 std::vector<std::vector<AlignedPair>> GpuAdaptiveBandedAligner::align(std::vector<SquiggleRead *> reads, const PoreModel *pore_model) {
@@ -837,7 +849,7 @@ std::vector<std::vector<AlignedPair>> GpuAdaptiveBandedAligner::align(std::vecto
     dim3 dimBlock(blockSize);
     dim3 dimGrid(numBlocks);
 
-    adaptiveBandedAlign <<<dimGrid, dimBlock, 0 >>> (bandScoreBuffer, numReads, nKmersDev, kmersDev, nEventsDev, eventsDev);
+    adaptiveBandedAlign <<<dimGrid, dimBlock, 0 >>> (bandScoreBuffer, traceBuffer, numReads, nKmersDev, kmersDev, nEventsDev, eventsDev);
 
     return std::vector<std::vector<AlignedPair>>();
 }
