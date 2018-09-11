@@ -74,6 +74,8 @@ private:
     int * nKmersHost;
     int * kmersHost;
     float * eventsHost;
+
+    int2 * lowerLeftBuffer;
 };
 
 class GpuAligner

@@ -10,6 +10,12 @@
 #define TO_STRING(X) EXPAND_TO_STRING(X)
 #define CU_CHECK_ERR(X) if (X != cudaSuccess){printf("CUDA error: <<%s>> at line %s\n", cudaGetErrorString(X), TO_STRING(__LINE__));throw std::runtime_error("CUDA ERROR");}
 
+#define move_down(curr_band) make_int2(curr_band.x + 1, curr_band.y)
+#define move_right(curr_band) make_int2(curr_band.x, curr_band.y + 1)
+#define band_kmer_to_offset(bi, ki) (ki) - lowerLeftBuffer[bi].y
+
+
+
 __device__ float logsumexpf(float x, float y){
     if(x == -INFINITY && y == -INFINITY){
         return -INFINITY;
@@ -753,6 +759,8 @@ GpuAdaptiveBandedAligner::GpuAdaptiveBandedAligner(){
 
     CU_CHECK_ERR(cudaMalloc((void**)&traceBuffer, max_band_buffer_size));
     CU_CHECK_ERR(cudaMalloc((void**)&bandScoreBuffer, max_band_buffer_size));
+
+    CU_CHECK_ERR(cudaMalloc((void**)&lowerLeftBuffer, max_n_bands * 2 * sizeof(int)));
 }
 
 GpuAdaptiveBandedAligner::~GpuAdaptiveBandedAligner(){
@@ -769,18 +777,30 @@ GpuAdaptiveBandedAligner::~GpuAdaptiveBandedAligner(){
     //CU_CHECK_ERR(cudaFree(eventsHost));
 }
 
+//TODO double-check all of these
+#define move_down(curr_band) make_int2(curr_band.x + 1, curr_band.y)
+#define move_right(curr_band) make_int2(curr_band.x, curr_band.y + 1)
+#define band_kmer_to_offset(bi, ki) (ki) - lowerLeftBuffer[bi].y
+#define band_event_to_offset(bi, ei) lowerLeftBuffer[bi].x - (ei)
+
 __global__ void adaptiveBandedAlign(float* bandScoreBuffer,
                                     int* traceBuffer,
                                     int numReads,
                                     int * nKmersDev,
                                     int * kmersDev,
 				                    int * nEventsDev,
-                                    float * eventsDev)
+                                    float * eventsDev,
+                                    int2* lowerLeftBuffer)
 {
   int n_kmers = nKmersDev[threadIdx.x];
   int n_events = nEventsDev[threadIdx.x];
 
-  float min_average_log_emission = -5.0;
+  // backtrack markers
+    const uint8_t from_d = 0;
+    const uint8_t from_u = 1;
+    const uint8_t from_l = 2;
+
+    float min_average_log_emission = -5.0;
   int max_gap_threshold = 50;
 
   // banding
@@ -803,7 +823,6 @@ __global__ void adaptiveBandedAlign(float* bandScoreBuffer,
   int n_cols = n_kmers + 1;
   int n_bands = n_rows + n_cols;
 
-    printf("Thread IDX: %i, n_bands: %i\n", threadIdx.x, n_bands);
     // Initialize the DP tables. Band-major, interleaved. -- is this correct
     // Is this what is taking so long?
     for(int band_idx = 0; band_idx<n_bands; band_idx++){
@@ -812,6 +831,23 @@ __global__ void adaptiveBandedAlign(float* bandScoreBuffer,
             traceBuffer[(band_idx * blockDim.x + threadIdx.x) * ADAPTIVE_ALIGNMENT_BANDWIDTH + b] = 0;
         }
     }
+
+    // initialize range of first two bands
+    lowerLeftBuffer[threadIdx.x].x = half_bandwidth - 1; // x is eventIdx
+    lowerLeftBuffer[threadIdx.y].y = -1 - half_bandwidth; // y is kmerIdx
+    lowerLeftBuffer[blockDim.x + 1 + threadIdx.x] = move_down(lowerLeftBuffer[threadIdx.x]);
+
+    // Set first band central cell to zero:
+    int start_cell_offset = band_kmer_to_offset(threadIdx.x, -1);
+    bandScoreBuffer[ADAPTIVE_ALIGNMENT_BANDWIDTH * threadIdx.x + start_cell_offset] = 0.0f;
+
+    // band 1: first event is trimmed
+    int first_trim_offset = band_event_to_offset(threadIdx.x + 1 * blockDim.x, 0);
+    bandScoreBuffer[(blockDim.x + threadIdx.x) * ADAPTIVE_ALIGNMENT_BANDWIDTH + first_trim_offset] = lp_trim;
+    traceBuffer[(blockDim.x + threadIdx.x) * ADAPTIVE_ALIGNMENT_BANDWIDTH + first_trim_offset] = from_u;
+
+    int fills = 0;
+    //Fill in remaining bands..
 };
 
 std::vector<std::vector<AlignedPair>> GpuAdaptiveBandedAligner::align(std::vector<SquiggleRead *> reads, const PoreModel *pore_model) {
@@ -849,7 +885,7 @@ std::vector<std::vector<AlignedPair>> GpuAdaptiveBandedAligner::align(std::vecto
     dim3 dimBlock(blockSize);
     dim3 dimGrid(numBlocks);
 
-    adaptiveBandedAlign <<<dimGrid, dimBlock, 0 >>> (bandScoreBuffer, traceBuffer, numReads, nKmersDev, kmersDev, nEventsDev, eventsDev);
+    adaptiveBandedAlign <<<dimGrid, dimBlock, 0 >>> (bandScoreBuffer, traceBuffer, numReads, nKmersDev, kmersDev, nEventsDev, eventsDev, lowerLeftBuffer);
 
     return std::vector<std::vector<AlignedPair>>();
 }
