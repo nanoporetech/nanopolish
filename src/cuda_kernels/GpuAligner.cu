@@ -594,7 +594,6 @@ std::vector<std::vector<std::vector<double>>> GpuAligner::scoreKernelMod(std::ve
     dim3 dimBlock(blockSize);
     dim3 dimGrid(numBlocks);
 
-    //printf("Launching get scores mod kernel\n");
     getScoresMod <<< dimGrid, dimBlock, 0, streams[0]>>> (poreModelDev,
                                                           readLengthsDev,
                                                           eventStartsDev,
@@ -760,7 +759,8 @@ GpuAdaptiveBandedAligner::GpuAdaptiveBandedAligner(){
     CU_CHECK_ERR(cudaMalloc((void**)&traceBuffer, max_band_buffer_size));
     CU_CHECK_ERR(cudaMalloc((void**)&bandScoreBuffer, max_band_buffer_size));
 
-    CU_CHECK_ERR(cudaMalloc((void**)&lowerLeftBuffer, max_n_bands * 2 * sizeof(int)));
+
+    CU_CHECK_ERR(cudaMalloc((void**)&lowerLeftBuffer, ADAPTIVE_ALIGNMENT_MAX_NUM_READS * max_n_bands * 2 * sizeof(int)));
 }
 
 GpuAdaptiveBandedAligner::~GpuAdaptiveBandedAligner(){
@@ -779,10 +779,11 @@ GpuAdaptiveBandedAligner::~GpuAdaptiveBandedAligner(){
 }
 
 //TODO double-check all of these
-#define move_down(curr_band) make_int2(curr_band.x + 1, curr_band.y)
-#define move_right(curr_band) make_int2(curr_band.x, curr_band.y + 1)
-#define band_kmer_to_offset(bi, ki) (ki) - lowerLeftBuffer[bi].y
-#define band_event_to_offset(bi, ei) lowerLeftBuffer[bi].x - (ei)
+#define move_down(curr_band) make_int2((curr_band).x + 1, (curr_band).y)
+#define move_right(curr_band) make_int2((curr_band).x, (curr_band).y + 1)
+#define band_kmer_to_offset(bi, ki) (ki) - lowerLeftBuffer[(bi)].y
+#define band_event_to_offset(bi, ei) lowerLeftBuffer[(bi)].x - (ei)
+#define band_offset(band_idx) (((band_idx) * blockDim.x + threadIdx.x) * ADAPTIVE_ALIGNMENT_BANDWIDTH)
 
 __global__ void adaptiveBandedAlign(float* bandScoreBuffer,
                                     int* traceBuffer,
@@ -849,7 +850,39 @@ __global__ void adaptiveBandedAlign(float* bandScoreBuffer,
 
     int fills = 0;
     //Fill in remaining bands..
-};
+
+    for(int band_idx = 2; band_idx < n_bands; ++band_idx) {
+        // Determine placement of this band according to Suzuki's adaptive algorithm
+        // When both ll and ur are out-of-band (ob) we alternate movements
+        // otherwise we decide based on scores
+
+        //CONVERTED
+        //NOT-CONVERTED
+        int llIdx = band_offset(band_idx - 1);
+        float ll = bandScoreBuffer[llIdx];
+        int urIdx = band_offset(band_idx - 1) + ADAPTIVE_ALIGNMENT_BANDWIDTH -1;
+        float ur = bandScoreBuffer[urIdx];
+
+        bool ll_ob = ll == -INFINITY;
+        bool ur_ob = ur == -INFINITY;
+
+        bool right = false;
+        if(ll_ob && ur_ob) {
+            right = band_idx % 2 == 1;
+        } else {
+            right = ll < ur; // Suzuki's rule
+        }
+
+        if(right) {
+            auto newPos = move_right(lowerLeftBuffer[blockDim.x * (band_idx - 1) + threadIdx.x]);
+            lowerLeftBuffer[blockDim.x * band_idx + threadIdx.x] = newPos;
+        } else {
+            lowerLeftBuffer[blockDim.x * band_idx + threadIdx.x] = move_down(lowerLeftBuffer[blockDim.x * (band_idx - 1) + threadIdx.x]);
+        }
+
+
+    }//BAND-FILL END
+}
 
 std::vector<std::vector<AlignedPair>> GpuAdaptiveBandedAligner::align(std::vector<SquiggleRead *> reads, const PoreModel *pore_model) {
     size_t numReads = reads.size();
