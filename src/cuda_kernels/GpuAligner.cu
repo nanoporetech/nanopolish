@@ -10,9 +10,8 @@
 #define TO_STRING(X) EXPAND_TO_STRING(X)
 #define CU_CHECK_ERR(X) if (X != cudaSuccess){printf("CUDA error: <<%s>> at line %s\n", cudaGetErrorString(X), TO_STRING(__LINE__));throw std::runtime_error("CUDA ERROR");}
 
-#define move_down(curr_band) make_int2(curr_band.x + 1, curr_band.y)
-#define move_right(curr_band) make_int2(curr_band.x, curr_band.y + 1)
-#define band_kmer_to_offset(bi, ki) (ki) - lowerLeftBuffer[bi].y
+//#define move_down(curr_band) make_int2(curr_band.x + 1, curr_band.y)
+//#define move_right(curr_band) make_int2(curr_band.x, curr_band.y + 1)
 
 
 
@@ -640,7 +639,6 @@ std::vector<std::vector<std::vector<double>>> GpuAligner::scoreKernelMod(std::ve
                 seqScores[readIdx] = score;
                 k++;
             }
-
             result[scoreSetIdx].push_back(seqScores);
         }
     }
@@ -781,9 +779,11 @@ GpuAdaptiveBandedAligner::~GpuAdaptiveBandedAligner(){
 //TODO double-check all of these
 #define move_down(curr_band) make_int2((curr_band).x + 1, (curr_band).y)
 #define move_right(curr_band) make_int2((curr_band).x, (curr_band).y + 1)
-#define band_kmer_to_offset(bi, ki) (ki) - lowerLeftBuffer[(bi)].y
+#define band_kmer_to_offset(bi, ki) (ki) - lowerLeftBuffer[(blockDim.x * (bi) + threadIdx.x)].y
 #define band_event_to_offset(bi, ei) lowerLeftBuffer[(bi)].x - (ei)
 #define band_offset(band_idx) (((band_idx) * blockDim.x + threadIdx.x) * ADAPTIVE_ALIGNMENT_BANDWIDTH)
+#define is_offset_valid(offset) (offset) >= 0 && (offset) < ADAPTIVE_ALIGNMENT_BANDWIDTH
+#define event_at_offset(bi, offset) lowerLeftBuffer[(bi) * blockIdx.x + threadIdx.x].x - (offset)
 
 __global__ void adaptiveBandedAlign(float* bandScoreBuffer,
                                     int* traceBuffer,
@@ -840,7 +840,7 @@ __global__ void adaptiveBandedAlign(float* bandScoreBuffer,
     lowerLeftBuffer[blockDim.x + 1 + threadIdx.x] = move_down(lowerLeftBuffer[threadIdx.x]);
 
     // Set first band central cell to zero:
-    int start_cell_offset = band_kmer_to_offset(threadIdx.x, -1);
+    int start_cell_offset = band_kmer_to_offset(0, -1);
     bandScoreBuffer[ADAPTIVE_ALIGNMENT_BANDWIDTH * threadIdx.x + start_cell_offset] = 0.0f;
 
     // band 1: first event is trimmed
@@ -856,8 +856,6 @@ __global__ void adaptiveBandedAlign(float* bandScoreBuffer,
         // When both ll and ur are out-of-band (ob) we alternate movements
         // otherwise we decide based on scores
 
-        //CONVERTED
-        //NOT-CONVERTED
         int llIdx = band_offset(band_idx - 1);
         float ll = bandScoreBuffer[llIdx];
         int urIdx = band_offset(band_idx - 1) + ADAPTIVE_ALIGNMENT_BANDWIDTH -1;
@@ -880,7 +878,17 @@ __global__ void adaptiveBandedAlign(float* bandScoreBuffer,
             lowerLeftBuffer[blockDim.x * band_idx + threadIdx.x] = move_down(lowerLeftBuffer[blockDim.x * (band_idx - 1) + threadIdx.x]);
         }
 
-
+        // If the trim state is within the band, fill it in here
+        int trim_offset = band_kmer_to_offset(band_idx, -1);
+        if(is_offset_valid(trim_offset)) {
+            int event_idx = event_at_offset(band_idx, trim_offset);
+            if(event_idx >= 0 && event_idx < n_events) {
+                bandScoreBuffer[band_offset(band_idx) + trim_offset] = lp_trim * (event_idx + 1);
+                traceBuffer[band_offset(band_idx) + trim_offset] = from_u;
+            } else {
+                bandScoreBuffer[band_offset(band_idx) + trim_offset] = -INFINITY;
+            }
+        }
     }//BAND-FILL END
 }
 
