@@ -770,6 +770,7 @@ GpuAdaptiveBandedAligner::~GpuAdaptiveBandedAligner(){
     CU_CHECK_ERR(cudaFree(kmersDev));
     CU_CHECK_ERR(cudaFree(bandScoreBuffer));
     CU_CHECK_ERR(cudaFree(traceBuffer));
+    CU_CHECK_ERR(cudaFree(lowerLeftBuffer));
 
     CU_CHECK_ERR(cudaFreeHost(nEventsHost));
     CU_CHECK_ERR(cudaFreeHost(nKmersHost));
