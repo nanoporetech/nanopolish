@@ -493,7 +493,6 @@ std::vector<std::vector<std::vector<double>>> GpuAligner::scoreKernelMod(std::ve
             poreModelInitialized = true;
         }
         // Sequences
-        // Sequences
         auto & sequences = scoreSet.stateSequences;
         numSequences += sequences.size();
 
@@ -732,6 +731,8 @@ std::vector<Variant> GpuAligner::variantScoresThresholded(std::vector<std::vecto
 }
 
 GpuAdaptiveBandedAligner::GpuAdaptiveBandedAligner(){
+    poreModelInitialized = false;
+
     size_t max_reads_per_worker = LOCI_PER_WORKER * MAX_COVERAGE * MAX_NUM_VARIANTS_PER_LOCUS;
     int readsSizeBuffer = max_reads_per_worker * sizeof(int);
     int maxBuffer = max_reads_per_worker * MAX_SEQUENCE_LENGTH * sizeof(int);
@@ -740,6 +741,18 @@ GpuAdaptiveBandedAligner::GpuAdaptiveBandedAligner(){
     // Need to allocate memory for the DP tables
     int max_n_bands = (ADAPTIVE_ALIGNMENT_MAX_N_EVENTS + 1) + (ADAPTIVE_ALIGNMENT_MAX_N_KMERS + 1);
     int max_band_buffer_size = ADAPTIVE_ALIGNMENT_MAX_NUM_READS * max_n_bands * ADAPTIVE_ALIGNMENT_BANDWIDTH * sizeof(float);
+
+    CU_CHECK_ERR(cudaMalloc((void**)&scaleDev, readsSizeBuffer));
+    CU_CHECK_ERR(cudaHostAlloc(&scaleHost, readsSizeBuffer, cudaHostAllocDefault));
+
+    CU_CHECK_ERR(cudaMalloc((void**)&shiftDev, readsSizeBuffer));
+    CU_CHECK_ERR(cudaHostAlloc(&shiftHost, readsSizeBuffer, cudaHostAllocDefault));
+
+    CU_CHECK_ERR(cudaMalloc((void**)&varDev, readsSizeBuffer));
+    CU_CHECK_ERR(cudaHostAlloc(&varHost, readsSizeBuffer, cudaHostAllocDefault));
+
+    CU_CHECK_ERR(cudaMalloc((void**)&logVarDev, readsSizeBuffer));
+    CU_CHECK_ERR(cudaHostAlloc(&logVarHost, readsSizeBuffer, cudaHostAllocDefault));
 
     //allocate a buffer to hold the number of events per read
     CU_CHECK_ERR(cudaMalloc((void**)&nEventsDev, readsSizeBuffer));
@@ -757,8 +770,13 @@ GpuAdaptiveBandedAligner::GpuAdaptiveBandedAligner(){
     CU_CHECK_ERR(cudaMalloc((void**)&traceBuffer, max_band_buffer_size));
     CU_CHECK_ERR(cudaMalloc((void**)&bandScoreBuffer, max_band_buffer_size));
 
-
     CU_CHECK_ERR(cudaMalloc((void**)&lowerLeftBuffer, ADAPTIVE_ALIGNMENT_MAX_NUM_READS * max_n_bands * 2 * sizeof(int)));
+
+    // Allocate Device memory for pore model
+    int numModelElements = 4096;//TODO: Don't hardcode
+    CU_CHECK_ERR(cudaMalloc((void**)&poreModelDev, numModelElements * 3 * sizeof(float)));
+    CU_CHECK_ERR(cudaHostAlloc(&poreModelHost, numModelElements * sizeof(float) * 3, cudaHostAllocDefault));
+
 }
 
 GpuAdaptiveBandedAligner::~GpuAdaptiveBandedAligner(){
@@ -770,20 +788,33 @@ GpuAdaptiveBandedAligner::~GpuAdaptiveBandedAligner(){
     CU_CHECK_ERR(cudaFree(traceBuffer));
     CU_CHECK_ERR(cudaFree(lowerLeftBuffer));
 
+    CU_CHECK_ERR(cudaFree(scaleDev));
+    CU_CHECK_ERR(cudaFree(shiftDev));
+    CU_CHECK_ERR(cudaFree(varDev));
+    CU_CHECK_ERR(cudaFree(logVarDev));
+    CU_CHECK_ERR(cudaFree(poreModelDev));
+
     CU_CHECK_ERR(cudaFreeHost(nEventsHost));
     CU_CHECK_ERR(cudaFreeHost(nKmersHost));
     CU_CHECK_ERR(cudaFreeHost(kmersHost));
-    //CU_CHECK_ERR(cudaFree(eventsHost));
+
+    CU_CHECK_ERR(cudaFreeHost(scaleHost));
+    CU_CHECK_ERR(cudaFreeHost(shiftHost));
+    CU_CHECK_ERR(cudaFreeHost(varHost));
+    CU_CHECK_ERR(cudaFreeHost(logVarHost));
+    CU_CHECK_ERR(cudaFreeHost(poreModelHost));
+    CU_CHECK_ERR(cudaFree(eventsHost));
 }
 
 //TODO double-check all of these
 #define move_down(curr_band) make_int2((curr_band).x + 1, (curr_band).y)
 #define move_right(curr_band) make_int2((curr_band).x, (curr_band).y + 1)
 #define band_kmer_to_offset(bi, ki) (ki) - lowerLeftBuffer[(blockDim.x * (bi) + threadIdx.x)].y
-#define band_event_to_offset(bi, ei) lowerLeftBuffer[(bi)].x - (ei)
+#define band_event_to_offset(bi, ei) lowerLeftBuffer[(bi) * blockDim.x + threadIdx.x].x - (ei)
 #define band_offset(band_idx) (((band_idx) * blockDim.x + threadIdx.x) * ADAPTIVE_ALIGNMENT_BANDWIDTH)
-#define is_offset_valid(offset) (offset) >= 0 && (offset) < ADAPTIVE_ALIGNMENT_BANDWIDTH
+#define is_offset_valid(offset) (offset) >= 0 && ((offset) < ADAPTIVE_ALIGNMENT_BANDWIDTH)
 #define event_at_offset(bi, offset) lowerLeftBuffer[(bi) * blockIdx.x + threadIdx.x].x - (offset)
+#define kmer_at_offset(bi, offset) lowerLeftBuffer[(bi) * blockIdx.x + threadIdx.x].y + (offset)
 
 __global__ void adaptiveBandedAlign(float* bandScoreBuffer,
                                     int* traceBuffer,
@@ -792,10 +823,16 @@ __global__ void adaptiveBandedAlign(float* bandScoreBuffer,
                                     int * kmersDev,
 				                    int * nEventsDev,
                                     float * eventsDev,
-                                    int2* lowerLeftBuffer)
-{
-  int n_kmers = nKmersDev[threadIdx.x];
-  int n_events = nEventsDev[threadIdx.x];
+                                    int2* lowerLeftBuffer,
+                                    float* scaleDev,
+                                    float* shiftDev,
+                                    float* varDev,
+                                    float* logVarDev,
+                                    float* poreModelDev,
+                                    float* levelMeanDev) {
+
+    int n_kmers = nKmersDev[threadIdx.x];
+    int n_events = nEventsDev[threadIdx.x];
 
   // backtrack markers
     const uint8_t from_d = 0;
@@ -844,7 +881,10 @@ __global__ void adaptiveBandedAlign(float* bandScoreBuffer,
     bandScoreBuffer[ADAPTIVE_ALIGNMENT_BANDWIDTH * threadIdx.x + start_cell_offset] = 0.0f;
 
     // band 1: first event is trimmed
-    int first_trim_offset = band_event_to_offset(threadIdx.x + 1 * blockDim.x, 0);
+    int first_trim_offset = band_event_to_offset(1, 0);
+
+
+
     bandScoreBuffer[(blockDim.x + threadIdx.x) * ADAPTIVE_ALIGNMENT_BANDWIDTH + first_trim_offset] = lp_trim;
     traceBuffer[(blockDim.x + threadIdx.x) * ADAPTIVE_ALIGNMENT_BANDWIDTH + first_trim_offset] = from_u;
 
@@ -889,7 +929,75 @@ __global__ void adaptiveBandedAlign(float* bandScoreBuffer,
                 bandScoreBuffer[band_offset(band_idx) + trim_offset] = -INFINITY;
             }
         }
-    }//BAND-FILL END
+        //Now fill out the inner loop
+
+        // Get the offsets for the first and last event and kmer
+        // We restrict the inner loop to only these values
+        int kmer_min_offset = band_kmer_to_offset(band_idx, 0);
+        int kmer_max_offset = band_kmer_to_offset(band_idx, n_kmers);
+        int event_min_offset = band_event_to_offset(band_idx, n_events - 1);
+        int event_max_offset = band_event_to_offset(band_idx, -1);
+
+        int min_offset = max(kmer_min_offset, event_min_offset);
+        min_offset = max(min_offset, 0);
+
+        int max_offset = min(kmer_max_offset, event_max_offset);
+        max_offset = min(max_offset, ADAPTIVE_ALIGNMENT_BANDWIDTH);
+
+        //Fill out the band inner loop
+        for(int offset = min_offset; offset < max_offset; ++offset) {
+            //TBC
+            int event_idx = event_at_offset(band_idx, offset);
+            int kmer_idx = kmer_at_offset(band_idx, offset);
+            int kmer_rank = kmersDev[blockDim.x * kmer_idx + threadIdx.x];
+            int offset_up   = band_event_to_offset(band_idx - 1, event_idx - 1);
+            int offset_left = band_kmer_to_offset(band_idx - 1, kmer_idx - 1);
+            int offset_diag = band_kmer_to_offset(band_idx - 2, kmer_idx - 1);
+
+            float up   = is_offset_valid(offset_up)   ? bandScoreBuffer[band_offset(band_idx - 1) + offset_up]   : -INFINITY;
+            float left = is_offset_valid(offset_left) ? bandScoreBuffer[band_offset(band_idx - 1) + offset_left] : -INFINITY;
+            float diag = is_offset_valid(offset_diag) ? bandScoreBuffer[band_offset(band_idx - 2) + offset_diag] : -INFINITY;
+
+            //TODO check that these are per-read statistics
+            float scale = scaleDev[threadIdx.x];
+            float shift = shiftDev[threadIdx.x];
+            float var = varDev[threadIdx.x];
+            float logVar = logVarDev[threadIdx.x];
+
+            float pore_mean = poreModelDev[kmer_rank * 3];
+            float pore_mean = poreModelDev[kmer_rank * 3 + 1];
+            float pore_mean = poreModelDev[kmer_rank * 3 + 2];
+
+            float level_mean = levelMeanDev[blockDim.x * event_idx + threadIdx.x];
+
+            float lp_emission = lp_match_r9(kmer_rank, //OK
+                                            level_mean, //Get the level mean
+                                            pore_mean,
+                                            pore_stdv,
+                                            pore_log_level_stdv,
+                                            scale,
+                                            shift,
+                                            var,
+                                            logVar);
+
+            float score_d = diag + lp_step + lp_emission;
+            float score_u = up + lp_stay + lp_emission;
+            float score_l = left + lp_skip;
+
+            float max_score = score_d;
+            int from = FROM_D;
+
+            max_score = score_u > max_score ? score_u : max_score;
+            from = max_score == score_u ? from_u : from;
+            max_score = score_l > max_score ? score_l : max_score;
+            from = max_score == score_l ? from_l : from;
+
+            bandScoreBuffer[band_offset(band_idx) +offset] = max_score;
+            traceBuffer[band_offset(band_idx) +offset] = from;
+            fills += 1;
+        }
+    }
+    //BAND-FILL END
 }
 
 std::vector<std::vector<AlignedPair>> GpuAdaptiveBandedAligner::align(std::vector<SquiggleRead *> reads, const PoreModel *pore_model) {
@@ -901,25 +1009,54 @@ std::vector<std::vector<AlignedPair>> GpuAdaptiveBandedAligner::align(std::vecto
     //Loop over all the reads, populating host buffers with the relevant information
     int kmersOffset = 0;
     for (int readIdx=0; readIdx < numReads; readIdx++) {//switch to index
-        // Populate host buffer with kmer ranks
         auto read = reads[readIdx];
+
+        //Read statistics - populate host buffers
+        scaleHost[readIdx] = read->scalings[e.strand].scale;
+        shiftHost[readIdx] = read->scalings[e.strand].shift;
+        varHost[readIdx] = read->scalings[e.strand].var;
+        logVarHost[readIdx] = read->scalings[e.strand].log_var;
+
+        // Populate host buffer with kmer ranks
         auto sequence = read->read_sequence;
         size_t n_kmers = sequence.size() - k + 1;
 	    size_t n_events = read->events->size(); //read->events.size();
-        for(int kmerIdx=0; kmerIdx<n_kmers;kmerIdx++){
-	  kmersHost[kmerIdx + kmersOffset] = alphabet->kmer_rank(sequence.substr(kmerIdx, k).c_str(), k);
+        for(int kmerIdx=0; kmerIdx<n_kmers;kmerIdx++){//Interleave the kmers
+            kmersHost[kmerIdx * numReads + readIdx] = alphabet->kmer_rank(sequence.substr(kmerIdx, k).c_str(), k);
         }
-	//TODO: Will also need to transfer the offsets.
+
+
         kmersOffset += n_kmers;
-        nKmersHost[readIdx] = n_kmers;
+    nKmersHost[readIdx] = n_kmers;
 	nEventsHost[readIdx] = n_events;
     }
 
-  
-   // do the transfers
+    if (poreModelInitialized == false) {
+        auto read = reads[0];
+        int num_states = read->base_model[0]->states.size();//4096
+        int poreModelEntriesPerState = 3;
+        for(int st=0; st<num_states; st++){
+            auto params = read->base_model->states[st];
+            poreModelHost[st * poreModelEntriesPerState] = params.level_mean;
+            poreModelHost[st * poreModelEntriesPerState + 1] = params.level_stdv;
+            poreModelHost[st * poreModelEntriesPerState + 2] = params.level_log_stdv;
+        }
+        // copy over the pore model
+        CU_CHECK_ERR(cudaMemcpyAsync(poreModelDev, poreModelHost,
+                                     poreModelEntriesPerState * num_states * sizeof(float), cudaMemcpyHostToDevice));
+        poreModelInitialized = true;
+    }
+
+
+    // do the transfers
     CU_CHECK_ERR(cudaMemcpyAsync(nKmersDev, nKmersHost, numReads * sizeof(int), cudaMemcpyHostToDevice));
     CU_CHECK_ERR(cudaMemcpyAsync(kmersDev, kmersHost, kmersOffset * sizeof(int), cudaMemcpyHostToDevice));
     CU_CHECK_ERR(cudaMemcpyAsync(nEventsDev, nEventsHost, numReads * sizeof(int), cudaMemcpyHostToDevice));
+
+    CU_CHECK_ERR(cudaMemcpyAsync(scaleDev, scaleHost, numReads * sizeof(float), cudaMemcpyHostToDevice));
+    CU_CHECK_ERR(cudaMemcpyAsync(shiftDev, shiftHost, numReads * sizeof(float), cudaMemcpyHostToDevice));
+    CU_CHECK_ERR(cudaMemcpyAsync(varDev, varHost, numReads * sizeof(float), cudaMemcpyHostToDevice));
+    CU_CHECK_ERR(cudaMemcpyAsync(logVarDev, logVarHost, numReads * sizeof(float), cudaMemcpyHostToDevice));
 
     // run the kernel
     size_t blockSize = numReads;
@@ -927,7 +1064,8 @@ std::vector<std::vector<AlignedPair>> GpuAdaptiveBandedAligner::align(std::vecto
     dim3 dimBlock(blockSize);
     dim3 dimGrid(numBlocks);
 
-    adaptiveBandedAlign <<<dimGrid, dimBlock, 0 >>> (bandScoreBuffer, traceBuffer, numReads, nKmersDev, kmersDev, nEventsDev, eventsDev, lowerLeftBuffer);
+    adaptiveBandedAlign <<<dimGrid, dimBlock, 0 >>> (bandScoreBuffer, traceBuffer, numReads, nKmersDev, kmersDev, nEventsDev, eventsDev, lowerLeftBuffer,
+            scaleDev, shiftDev, varDev, logVarDev, poreModelDev);
 
     return std::vector<std::vector<AlignedPair>>();
 }

@@ -70,10 +70,24 @@ private:
     float * bandScoreBuffer;
     int * traceBuffer;
 
+    float * scaleHost;
+    float * shiftHost;
+    float * varHost;
+    float * logVarHost;
+
+    float * scaleDev;
+    float * shiftDev;
+    float * varDev;
+    float * logVarDev;
+
     int * nEventsHost;
     int * nKmersHost;
     int * kmersHost;
     float * eventsHost;
+
+    bool poreModelInitialized;
+    float* poreModelDev;
+    float* poreModelHost;
 
     int2 * lowerLeftBuffer;
 };
