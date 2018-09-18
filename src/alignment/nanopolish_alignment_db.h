@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <cuda_kernels/GpuAligner.h>
 #include "nanopolish_anchor.h"
 #include "nanopolish_variant.h"
 
@@ -151,7 +152,7 @@ class AlignmentDB
         SquiggleReadMap m_squiggle_read_map;
         std::string m_model_type_string;
 
-    void _batch_align(const std::vector<SequenceAlignmentRecord> &sequence_records);
+    void _batch_align(const std::vector<SequenceAlignmentRecord> &sequence_records, GpuAdaptiveBandedAligner& gpu_aligner);
 };
 
 #endif

@@ -471,7 +471,7 @@ std::vector<std::vector<std::vector<double>>> GpuAligner::scoreKernelMod(std::ve
                 //populate the pre/post-flanking data, since it has a 1-1 correspondence with events
                 preFlankingHost[rawReadOffset + i] = pre_flank[i];
                 postFlankingHost[rawReadOffset + i] = post_flank[i];
-                }
+            }
 
             rawReadOffset += n_events;
             globalReadIdx++;
@@ -765,7 +765,8 @@ GpuAdaptiveBandedAligner::GpuAdaptiveBandedAligner(){
     CU_CHECK_ERR(cudaHostAlloc(&kmersHost, maxBuffer, cudaHostAllocDefault));
 
     CU_CHECK_ERR(cudaMalloc((void**)&eventsDev, maxBuffer));
-    CU_CHECK_ERR(cudaHostAlloc(&eventsHost, readsSizeBuffer, cudaHostAllocDefault));
+    CU_CHECK_ERR(cudaHostAlloc(&eventsHost, ADAPTIVE_ALIGNMENT_MAX_N_EVENTS * max_reads_per_worker * sizeof(float),
+                               cudaHostAllocDefault));
 
     CU_CHECK_ERR(cudaMalloc((void**)&traceBuffer, max_band_buffer_size));
     CU_CHECK_ERR(cudaMalloc((void**)&bandScoreBuffer, max_band_buffer_size));
@@ -773,13 +774,21 @@ GpuAdaptiveBandedAligner::GpuAdaptiveBandedAligner(){
     CU_CHECK_ERR(cudaMalloc((void**)&lowerLeftBuffer, ADAPTIVE_ALIGNMENT_MAX_NUM_READS * max_n_bands * 2 * sizeof(int)));
 
     // Allocate Device memory for pore model
-    int numModelElements = 4096;//TODO: Don't hardcode
     CU_CHECK_ERR(cudaMalloc((void**)&poreModelDev, numModelElements * 3 * sizeof(float)));
     CU_CHECK_ERR(cudaHostAlloc(&poreModelHost, numModelElements * sizeof(float) * 3, cudaHostAllocDefault));
-
 }
 
 GpuAdaptiveBandedAligner::~GpuAdaptiveBandedAligner(){
+    auto a = cudaFreeHost(nEventsHost);
+    CU_CHECK_ERR(a);
+    CU_CHECK_ERR(cudaFreeHost(nKmersHost));
+    CU_CHECK_ERR(cudaFreeHost(kmersHost));
+    CU_CHECK_ERR(cudaFreeHost(scaleHost));
+    CU_CHECK_ERR(cudaFreeHost(shiftHost));
+    CU_CHECK_ERR(cudaFreeHost(varHost));
+    CU_CHECK_ERR(cudaFreeHost(logVarHost));
+    CU_CHECK_ERR(cudaFreeHost(poreModelHost));
+    CU_CHECK_ERR(cudaFreeHost(eventsHost));
     CU_CHECK_ERR(cudaFree(nEventsDev));
     CU_CHECK_ERR(cudaFree(eventsDev));
     CU_CHECK_ERR(cudaFree(nKmersDev));
@@ -787,23 +796,11 @@ GpuAdaptiveBandedAligner::~GpuAdaptiveBandedAligner(){
     CU_CHECK_ERR(cudaFree(bandScoreBuffer));
     CU_CHECK_ERR(cudaFree(traceBuffer));
     CU_CHECK_ERR(cudaFree(lowerLeftBuffer));
-
     CU_CHECK_ERR(cudaFree(scaleDev));
     CU_CHECK_ERR(cudaFree(shiftDev));
     CU_CHECK_ERR(cudaFree(varDev));
     CU_CHECK_ERR(cudaFree(logVarDev));
     CU_CHECK_ERR(cudaFree(poreModelDev));
-
-    CU_CHECK_ERR(cudaFreeHost(nEventsHost));
-    CU_CHECK_ERR(cudaFreeHost(nKmersHost));
-    CU_CHECK_ERR(cudaFreeHost(kmersHost));
-
-    CU_CHECK_ERR(cudaFreeHost(scaleHost));
-    CU_CHECK_ERR(cudaFreeHost(shiftHost));
-    CU_CHECK_ERR(cudaFreeHost(varHost));
-    CU_CHECK_ERR(cudaFreeHost(logVarHost));
-    CU_CHECK_ERR(cudaFreeHost(poreModelHost));
-    CU_CHECK_ERR(cudaFree(eventsHost));
 }
 
 //TODO double-check all of these
@@ -828,8 +825,7 @@ __global__ void adaptiveBandedAlign(float* bandScoreBuffer,
                                     float* shiftDev,
                                     float* varDev,
                                     float* logVarDev,
-                                    float* poreModelDev,
-                                    float* levelMeanDev) {
+                                    float* poreModelDev) {
 
     int n_kmers = nKmersDev[threadIdx.x];
     int n_events = nEventsDev[threadIdx.x];
@@ -965,10 +961,10 @@ __global__ void adaptiveBandedAlign(float* bandScoreBuffer,
             float logVar = logVarDev[threadIdx.x];
 
             float pore_mean = poreModelDev[kmer_rank * 3];
-            float pore_mean = poreModelDev[kmer_rank * 3 + 1];
-            float pore_mean = poreModelDev[kmer_rank * 3 + 2];
+            float pore_stdv = poreModelDev[kmer_rank * 3 + 1];
+            float pore_log_level_stdv = poreModelDev[kmer_rank * 3 + 2];
 
-            float level_mean = levelMeanDev[blockDim.x * event_idx + threadIdx.x];
+            float level_mean = eventsDev[blockDim.x * event_idx + threadIdx.x];
 
             float lp_emission = lp_match_r9(kmer_rank, //OK
                                             level_mean, //Get the level mean
@@ -1008,14 +1004,18 @@ std::vector<std::vector<AlignedPair>> GpuAdaptiveBandedAligner::align(std::vecto
 
     //Loop over all the reads, populating host buffers with the relevant information
     int kmersOffset = 0;
-    for (int readIdx=0; readIdx < numReads; readIdx++) {//switch to index
+    int max_n_events = 0;
+    for (int readIdx=0; readIdx < numReads; readIdx++) {
         auto read = reads[readIdx];
 
         //Read statistics - populate host buffers
-        scaleHost[readIdx] = read->scalings[e.strand].scale;
-        shiftHost[readIdx] = read->scalings[e.strand].shift;
-        varHost[readIdx] = read->scalings[e.strand].var;
-        logVarHost[readIdx] = read->scalings[e.strand].log_var;
+        int strand = 0; //TODO - check this. It is probably wrong because this is not how the other function is doing it, there is an object called 'e' in that case and strand is e.strand
+        //TODO Where does this function get
+        shiftHost[readIdx] = read->scalings[0].shift;
+        varHost[readIdx] = read->scalings[0].var;
+        logVarHost[readIdx] = read->scalings[0].log_var;
+        auto scale = read->scalings[0].scale;
+        scaleHost[readIdx] = scale;
 
         // Populate host buffer with kmer ranks
         auto sequence = read->read_sequence;
@@ -1025,10 +1025,19 @@ std::vector<std::vector<AlignedPair>> GpuAdaptiveBandedAligner::align(std::vecto
             kmersHost[kmerIdx * numReads + readIdx] = alphabet->kmer_rank(sequence.substr(kmerIdx, k).c_str(), k);
         }
 
+        max_n_events = (n_events > max_n_events) ? n_events : max_n_events;
 
         kmersOffset += n_kmers;
-    nKmersHost[readIdx] = n_kmers;
-	nEventsHost[readIdx] = n_events;
+        nKmersHost[readIdx] = n_kmers;
+	    nEventsHost[readIdx] = n_events;
+
+	    int e_start = 0;
+	    int e_stride = 5; //TODO: Check this, it seems wrong - what does the host code use exactly?
+        for (int i=0;i<n_events;i++) {
+            auto event_idx =  e_start + i * e_stride;
+            auto scaled = read->get_drift_scaled_level(event_idx, 0); // TODO is strand correct? - I think this may be wrong, not what the other aligner did
+            eventsHost[i * numReads + readIdx] = scaled;
+        }
     }
 
     if (poreModelInitialized == false) {
@@ -1036,10 +1045,11 @@ std::vector<std::vector<AlignedPair>> GpuAdaptiveBandedAligner::align(std::vecto
         int num_states = read->base_model[0]->states.size();//4096
         int poreModelEntriesPerState = 3;
         for(int st=0; st<num_states; st++){
-            auto params = read->base_model->states[st];
-            poreModelHost[st * poreModelEntriesPerState] = params.level_mean;
-            poreModelHost[st * poreModelEntriesPerState + 1] = params.level_stdv;
-            poreModelHost[st * poreModelEntriesPerState + 2] = params.level_log_stdv;
+	  //auto base_model = read->base_model;
+	  const PoreModelStateParams& params = pore_model->states[st];
+          poreModelHost[st * poreModelEntriesPerState] = params.level_mean;
+          poreModelHost[st * poreModelEntriesPerState + 1] = params.level_stdv;
+          poreModelHost[st * poreModelEntriesPerState + 2] = params.level_log_stdv;
         }
         // copy over the pore model
         CU_CHECK_ERR(cudaMemcpyAsync(poreModelDev, poreModelHost,
@@ -1057,6 +1067,7 @@ std::vector<std::vector<AlignedPair>> GpuAdaptiveBandedAligner::align(std::vecto
     CU_CHECK_ERR(cudaMemcpyAsync(shiftDev, shiftHost, numReads * sizeof(float), cudaMemcpyHostToDevice));
     CU_CHECK_ERR(cudaMemcpyAsync(varDev, varHost, numReads * sizeof(float), cudaMemcpyHostToDevice));
     CU_CHECK_ERR(cudaMemcpyAsync(logVarDev, logVarHost, numReads * sizeof(float), cudaMemcpyHostToDevice));
+    CU_CHECK_ERR(cudaMemcpyAsync(eventsDev, eventsHost, max_n_events * numReads * sizeof(float), cudaMemcpyHostToDevice));
 
     // run the kernel
     size_t blockSize = numReads;
@@ -1067,5 +1078,6 @@ std::vector<std::vector<AlignedPair>> GpuAdaptiveBandedAligner::align(std::vecto
     adaptiveBandedAlign <<<dimGrid, dimBlock, 0 >>> (bandScoreBuffer, traceBuffer, numReads, nKmersDev, kmersDev, nEventsDev, eventsDev, lowerLeftBuffer,
             scaleDev, shiftDev, varDev, logVarDev, poreModelDev);
 
+    cudaDeviceSynchronize();
     return std::vector<std::vector<AlignedPair>>();
 }

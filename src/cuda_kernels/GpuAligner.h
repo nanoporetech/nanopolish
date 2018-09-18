@@ -90,6 +90,8 @@ private:
     float* poreModelHost;
 
     int2 * lowerLeftBuffer;
+
+    GpuAdaptiveBandedAligner(const GpuAdaptiveBandedAligner&) = delete;
 };
 
 class GpuAligner

@@ -560,8 +560,9 @@ std::vector<EventAlignmentRecord> AlignmentDB::_load_events_by_region_from_bam(c
     return records;
 }
 
+
 //For now we do this as a loop, then delegate to GPU.
-void AlignmentDB::_batch_align(const std::vector<SequenceAlignmentRecord>& sequence_records){
+void AlignmentDB::_batch_align(const std::vector<SequenceAlignmentRecord>& sequence_records, GpuAdaptiveBandedAligner& gpu_aligner){
     size_t num_sequence_records = sequence_records.size();
     std::vector<SquiggleRead*> reads(num_sequence_records);
     for (int i=0; i<num_sequence_records;i++){
@@ -570,9 +571,7 @@ void AlignmentDB::_batch_align(const std::vector<SequenceAlignmentRecord>& seque
     auto model = reads[0]->base_model[0];
 
     // The GPU method:
-    GpuAdaptiveBandedAligner gpu_aligner;
     std::vector<std::vector<AlignedPair>> event_alignment_gpu = gpu_aligner.align(reads, model);
-
     // The CPU method:
     for(int i=0;i < num_sequence_records; i++) {
         SquiggleRead *sr = reads[i];
@@ -601,6 +600,7 @@ std::vector<EventAlignmentRecord> AlignmentDB::_load_events_by_region_from_read(
         num_batches++;
     }
     int record_idx = 0;
+    GpuAdaptiveBandedAligner gpu_aligner;
     for (int batch_idx=0; batch_idx<num_batches; batch_idx++){
         std::vector<SequenceAlignmentRecord> record_batch;
         for(int b=0; b<batch_size;b++){
@@ -609,8 +609,9 @@ std::vector<EventAlignmentRecord> AlignmentDB::_load_events_by_region_from_read(
                 record_idx++;
             }
         }
-        _batch_align(record_batch);
+        _batch_align(record_batch, gpu_aligner);
     }
+
 
     #pragma omp parallel for
     for(size_t i = 0; i < sequence_records.size(); ++i) {
