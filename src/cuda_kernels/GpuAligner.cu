@@ -742,6 +742,9 @@ GpuAdaptiveBandedAligner::GpuAdaptiveBandedAligner(){
     int max_n_bands = (ADAPTIVE_ALIGNMENT_MAX_N_EVENTS + 1) + (ADAPTIVE_ALIGNMENT_MAX_N_KMERS + 1);
     int max_band_buffer_size = ADAPTIVE_ALIGNMENT_MAX_NUM_READS * max_n_bands * ADAPTIVE_ALIGNMENT_BANDWIDTH * sizeof(float);
 
+    CU_CHECK_ERR(cudaMalloc((void**)&alignmentResultDev, maxBuffer));
+    CU_CHECK_ERR(cudaHostAlloc(&alignmentResultHost, maxBuffer, cudaHostAllocDefault));
+
     CU_CHECK_ERR(cudaMalloc((void**)&scaleDev, readsSizeBuffer));
     CU_CHECK_ERR(cudaHostAlloc(&scaleHost, readsSizeBuffer, cudaHostAllocDefault));
 
@@ -804,6 +807,7 @@ GpuAdaptiveBandedAligner::~GpuAdaptiveBandedAligner(){
 }
 
 //TODO double-check all of these
+#define event_kmer_to_band(ei, ki) ((ei) + 1) + ((ki) + 1)
 #define move_down(curr_band) make_int2((curr_band).x + 1, (curr_band).y)
 #define move_right(curr_band) make_int2((curr_band).x, (curr_band).y + 1)
 #define band_kmer_to_offset(bi, ki) (ki) - lowerLeftBuffer[(blockDim.x * (bi) + threadIdx.x)].y
@@ -825,7 +829,8 @@ __global__ void adaptiveBandedAlign(float* bandScoreBuffer,
                                     float* shiftDev,
                                     float* varDev,
                                     float* logVarDev,
-                                    float* poreModelDev) {
+                                    float* poreModelDev,
+                                    float * alignmentResultDev) {
 
     int n_kmers = nKmersDev[threadIdx.x];
     int n_events = nEventsDev[threadIdx.x];
@@ -994,6 +999,29 @@ __global__ void adaptiveBandedAlign(float* bandScoreBuffer,
         }
     }
     //BAND-FILL END
+
+    //Backtrack
+    double sum_emission = 0;
+    double n_aligned_events = 0;
+
+    float max_score = -INFINITY;
+    int curr_event_idx = 0;
+    int curr_kmer_idx = n_kmers -1;
+
+    // Find best score between an event and the last k-mer. after trimming the remaining evnets
+    for(int event_idx = 0; event_idx < n_events; ++event_idx) {
+        int band_idx = event_kmer_to_band(event_idx, curr_kmer_idx);
+        //TODO port the following
+        int offset = band_event_to_offset(band_idx, event_idx);
+        if(is_offset_valid(offset)) {
+            float s = bands[band_idx][offset] + (n_events - event_idx) * lp_trim;
+            if(s > max_score) {
+                max_score = s;
+                curr_event_idx = event_idx;
+            }
+        }
+    }
+
 }
 
 std::vector<std::vector<AlignedPair>> GpuAdaptiveBandedAligner::align(std::vector<SquiggleRead *> reads, const PoreModel *pore_model) {
@@ -1076,7 +1104,7 @@ std::vector<std::vector<AlignedPair>> GpuAdaptiveBandedAligner::align(std::vecto
     dim3 dimGrid(numBlocks);
 
     adaptiveBandedAlign <<<dimGrid, dimBlock, 0 >>> (bandScoreBuffer, traceBuffer, numReads, nKmersDev, kmersDev, nEventsDev, eventsDev, lowerLeftBuffer,
-            scaleDev, shiftDev, varDev, logVarDev, poreModelDev);
+            scaleDev, shiftDev, varDev, logVarDev, poreModelDev, alignmentResultDev);
 
     cudaDeviceSynchronize();
     return std::vector<std::vector<AlignedPair>>();

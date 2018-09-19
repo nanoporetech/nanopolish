@@ -84,6 +84,8 @@ private:
     int * nKmersHost;
     int * kmersHost;
     float * eventsHost;
+    float * alignmentResultDev;
+    float * alignmentResultHost;
 
     bool poreModelInitialized;
     float* poreModelDev;
